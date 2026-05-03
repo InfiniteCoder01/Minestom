@@ -4,6 +4,7 @@ import net.kyori.adventure.key.Key;
 import net.kyori.adventure.nbt.BinaryTag;
 import net.kyori.adventure.nbt.CompoundBinaryTag;
 import net.kyori.adventure.text.Component;
+import net.minestom.server.adventure.MinestomAdventure;
 import net.kyori.adventure.text.format.Style;
 import net.kyori.adventure.util.TriState;
 import net.minestom.server.codec.CodecImpl.PrimitiveImpl;
@@ -131,6 +132,11 @@ public interface Codec<T extends @UnknownNullability Object> extends Encoder<T>,
             value -> RawValue.of(Transcoder.NBT, value));
 
     StructCodec<CompoundBinaryTag> NBT_COMPOUND = new CodecImpl.CompoundBinaryTagImpl();
+
+    Codec<CompoundBinaryTag> NBT_COMPOUND_COERCED = Codec.NBT_COMPOUND.orElse(Codec.STRING.transform(
+            string -> MinestomAdventure.tagStringIO().asCompound(string),
+            tag -> MinestomAdventure.tagStringIO().asString(tag)
+    ));
 
     /**
      * Creates an enum codec from a given class
