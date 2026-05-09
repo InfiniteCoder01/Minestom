@@ -15,7 +15,6 @@ import net.minestom.server.event.instance.InstanceBlockUpdateEvent;
 import net.minestom.server.event.instance.InstanceChunkLoadEvent;
 import net.minestom.server.event.instance.InstanceChunkUnloadEvent;
 import net.minestom.server.event.player.PlayerBlockBreakEvent;
-import net.minestom.server.instance.anvil.AnvilLoader;
 import net.minestom.server.instance.block.Block;
 import net.minestom.server.instance.block.BlockEntityType;
 import net.minestom.server.instance.block.BlockFace;
@@ -29,7 +28,7 @@ import net.minestom.server.network.packet.server.play.BlockChangePacket;
 import net.minestom.server.network.packet.server.play.BlockEntityDataPacket;
 import net.minestom.server.network.packet.server.play.UnloadChunkPacket;
 import net.minestom.server.network.packet.server.play.WorldEventPacket;
-import net.minestom.server.registry.DynamicRegistry;
+import net.minestom.server.registry.Registries;
 import net.minestom.server.registry.RegistryKey;
 import net.minestom.server.utils.PacketSendingUtils;
 import net.minestom.server.utils.async.AsyncUtils;
@@ -62,7 +61,7 @@ import static net.minestom.server.utils.chunk.ChunkUtils.isLoaded;
 public class InstanceContainer extends Instance {
     private static final Logger LOGGER = LoggerFactory.getLogger(InstanceContainer.class);
 
-    private static final AnvilLoader DEFAULT_LOADER = new AnvilLoader("world");
+    private static final NoopChunkLoaderImpl DEFAULT_LOADER = NoopChunkLoaderImpl.INSTANCE;
 
     private static final BlockFace[] BLOCK_UPDATE_FACES = new BlockFace[]{
             BlockFace.WEST, BlockFace.EAST, BlockFace.NORTH, BlockFace.SOUTH, BlockFace.BOTTOM, BlockFace.TOP
@@ -107,17 +106,17 @@ public class InstanceContainer extends Instance {
     }
 
     public InstanceContainer(UUID uuid, RegistryKey<DimensionType> dimensionType, @Nullable ChunkLoader loader, Key dimensionName) {
-        this(MinecraftServer.getDimensionTypeRegistry(), uuid, dimensionType, loader, dimensionName);
+        this(MinecraftServer.process(), uuid, dimensionType, loader, dimensionName);
     }
 
     public InstanceContainer(
-            DynamicRegistry<DimensionType> dimensionTypeRegistry,
+            Registries registries,
             UUID uuid,
             RegistryKey<DimensionType> dimensionType,
             @Nullable ChunkLoader loader,
             Key dimensionName
     ) {
-        super(dimensionTypeRegistry, uuid, dimensionType, dimensionName);
+        super(registries, uuid, dimensionType, dimensionName);
         setChunkSupplier(DynamicChunk::new);
         setChunkLoader(Objects.requireNonNullElse(loader, DEFAULT_LOADER));
         this.chunkLoader.loadInstance(this);
@@ -157,7 +156,8 @@ public class InstanceContainer extends Instance {
             return;
         }
 
-        synchronized (chunk) {
+        chunk.lockWriteLock();
+        try {
             // Refresh the last block change time
             this.lastBlockChangeTime = System.nanoTime();
             final BlockVec blockPosition = new BlockVec(x, y, z);
@@ -210,6 +210,8 @@ public class InstanceContainer extends Instance {
                 }
             }
             EventDispatcher.call(new InstanceBlockUpdateEvent(this, blockPosition, block));
+        } finally {
+            chunk.unlockWriteLock();
         }
     }
 
@@ -226,7 +228,7 @@ public class InstanceContainer extends Instance {
     @Override
     public boolean breakBlock(Player player, Point blockPosition, BlockFace blockFace, boolean doBlockUpdates) {
         final Chunk chunk = getChunkAt(blockPosition);
-        Check.notNull(chunk, "You cannot break blocks in a null chunk!");
+        Objects.requireNonNull(chunk, "You cannot break blocks in a null chunk!");
         if (chunk.isReadOnly()) return false;
         if (!isLoaded(chunk)) return false;
 
@@ -239,7 +241,7 @@ public class InstanceContainer extends Instance {
             chunk.sendChunk(player);
             return false;
         }
-        PlayerBlockBreakEvent blockBreakEvent = new PlayerBlockBreakEvent(player, block, Block.AIR, new BlockVec(blockPosition), blockFace);
+        PlayerBlockBreakEvent blockBreakEvent = new PlayerBlockBreakEvent(player, this, block, Block.AIR, blockPosition.asBlockVec(), blockFace);
         EventDispatcher.call(blockBreakEvent);
         final boolean allowed = !blockBreakEvent.isCancelled();
         if (allowed) {
@@ -382,7 +384,7 @@ public class InstanceContainer extends Instance {
 
     protected Chunk createChunk(int chunkX, int chunkZ) {
         final Chunk chunk = chunkSupplier.createChunk(this, chunkX, chunkZ);
-        Check.notNull(chunk, "Chunks supplied by a ChunkSupplier cannot be null.");
+        Objects.requireNonNull(chunk, "Chunks supplied by a ChunkSupplier cannot be null.");
         Generator generator = generator();
         if (generator == null || !chunk.shouldGenerate()) {
             // No chunk generator, execute the callback with the empty chunk
@@ -460,12 +462,15 @@ public class InstanceContainer extends Instance {
     }
 
     private void applyFork(Chunk chunk, GeneratorImpl.SectionModifierImpl sectionModifier) {
-        synchronized (chunk) {
+        chunk.lockWriteLock();
+        try {
             Section section = chunk.getSectionAt(sectionModifier.start().blockY());
             Palette currentBlocks = section.blockPalette();
             // -1 is necessary because forked units handle explicit changes by changing AIR 0 to 1
             sectionModifier.genSection().blocks().getAllPresent((x, y, z, value) -> currentBlocks.set(x, y, z, value - 1));
             applyGenerationData(chunk, sectionModifier);
+        } finally {
+            chunk.unlockWriteLock();
         }
     }
 
@@ -473,7 +478,8 @@ public class InstanceContainer extends Instance {
         var cache = section.genSection().specials();
         if (cache.isEmpty()) return;
         final int height = section.start().blockY();
-        synchronized (chunk) {
+        chunk.lockWriteLock();
+        try {
             Int2ObjectMaps.fastForEach(cache, blockEntry -> {
                 final int index = blockEntry.getIntKey();
                 final Block block = blockEntry.getValue();
@@ -482,6 +488,8 @@ public class InstanceContainer extends Instance {
                 final int z = CoordConversion.chunkBlockIndexGetZ(index);
                 chunk.setBlock(x, y, z, block);
             });
+        } finally {
+            chunk.unlockWriteLock();
         }
     }
 
@@ -627,9 +635,12 @@ public class InstanceContainer extends Instance {
         CompletableFuture<Void> future = new CompletableFuture<>();
         Thread.startVirtualThread(() -> {
             Chunk chunk = loadChunk(chunkX, chunkZ).join();
-            synchronized (chunk) {
+            chunk.lockWriteLock();
+            try {
                 generateChunk(chunk, generator);
                 chunk.invalidate();
+            } finally {
+                chunk.unlockWriteLock();
             }
             chunk.sendChunk();
             future.complete(null);

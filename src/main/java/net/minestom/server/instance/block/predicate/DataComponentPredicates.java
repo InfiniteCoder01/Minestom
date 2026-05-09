@@ -12,6 +12,7 @@ import net.minestom.server.utils.validate.Check;
 import java.util.*;
 import java.util.function.Predicate;
 
+// TODO: 26.1: `villager/variant`
 public record DataComponentPredicates(DataComponentMap exact,
                                       ComponentPredicateSet predicates) implements Predicate<DataComponent.Holder> {
 
